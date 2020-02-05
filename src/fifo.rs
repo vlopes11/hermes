@@ -1,11 +1,11 @@
-use crate::Task;
+use crate::RawTask;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct Fifo {
     pub head: Mutex<u8>,
     pub tail: u8,
-    pub tasks: [Option<Task>; 256],
+    pub tasks: [Option<RawTask>; 256],
 }
 
 impl Default for Fifo {
@@ -23,14 +23,8 @@ impl Fifo {
     /// if it was pushed
     ///
     /// It is expected that the scheduler will try to wake any sleeping consumer after this call
-    pub fn push(&mut self, task: Task) -> Option<Task> {
-        // TODO - Maybe change to Ordering::Relaxed? False positives are not a problem because the
-        // worst case scenario is the task will be rescheduled
-        let head = match self.head.try_lock().map(|h| *h) {
-            Ok(h) => h,
-            Err(_) => return None,
-        };
-        if self.tail == head && self.tasks[self.tail as usize].is_some() {
+    pub fn push(&mut self, task: RawTask) -> Option<RawTask> {
+        if self.is_full() {
             return Some(task);
         }
 
@@ -44,7 +38,7 @@ impl Fifo {
         None
     }
 
-    pub fn pop(&mut self) -> Option<Task> {
+    pub fn pop(&mut self) -> Option<RawTask> {
         // TODO - Change to Ordering::AcqRel - Critical section
         let head = match self.head.try_lock().map(|ref mut h| {
             let head = **h;
@@ -58,6 +52,32 @@ impl Fifo {
         };
 
         self.tasks[head as usize].take()
+    }
+
+    pub fn is_full(&self) -> bool {
+        // TODO - Maybe change to Ordering::Relaxed? False positives are not a problem because the
+        // worst case scenario is the task will be rescheduled
+        let head = match self.head.try_lock().map(|h| *h) {
+            Ok(h) => h,
+            Err(_) => return true,
+        };
+
+        self.tail == head && self.tasks[self.tail as usize].is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        // TODO - Maybe change to Ordering::Relaxed? False positives are not a problem because the
+        // worst case scenario is the task will be rescheduled
+        let head = match self.head.try_lock().map(|h| *h) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        self.tasks[head as usize].is_none()
+    }
+
+    pub fn get_mut_unchecked(arc: &mut Arc<Fifo>) -> &mut Self {
+        unsafe { Arc::get_mut_unchecked(arc) }
     }
 }
 
@@ -113,19 +133,19 @@ mod tests {
             let fifo_base = Arc::new(Fifo::default());
 
             let input = (0..256)
-                .map(|i| format!("Task {:06}", i))
+                .map(|i| format!("RawTask {:06}", i))
                 .collect::<Vec<String>>();
 
             let mut fifo = Arc::clone(&fifo_base);
             {
-                let fifo = unsafe { Arc::get_mut_unchecked(&mut fifo) };
+                let fifo = Fifo::get_mut_unchecked(&mut fifo);
 
                 for s in input.clone() {
                     fifo.push(s.into_bytes().into());
                 }
 
                 assert!(fifo
-                    .push(format!("Task overflow").into_bytes().into())
+                    .push(format!("RawTask overflow").into_bytes().into())
                     .is_some());
             }
 
@@ -137,7 +157,7 @@ mod tests {
                 let mut fifo = Arc::clone(&fifo_base);
 
                 children.push(thread::spawn(move || {
-                    let fifo = unsafe { Arc::get_mut_unchecked(&mut fifo) };
+                    let fifo = Fifo::get_mut_unchecked(&mut fifo);
                     let mut completed = vec![];
 
                     while let Some(task) = fifo.pop() {
