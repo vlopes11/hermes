@@ -33,8 +33,7 @@ impl fmt::Display for EvaluationResult {
 }
 
 pub struct Scheduler {
-    pub fifo: Arc<Fifo>,
-
+    pub fifo: Arc<Fifo<RawTask>>,
     pub children: Vec<JoinHandle<()>>,
     pub sleeping_children: Vec<usize>,
     pub buffered_tasks: Vec<RawTask>,

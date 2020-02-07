@@ -1,5 +1,3 @@
-use crate::RawTask;
-
 #[cfg(feature = "trace")]
 use tracing::trace;
 
@@ -8,44 +6,45 @@ use loom::sync::atomic::{AtomicU8, AtomicUsize};
 #[cfg(not(test))]
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 
+use std::fmt;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::thread;
 
 pub const FIFO_CAPACITY: usize = 256;
 
-pub struct Fifo {
+pub struct Fifo<T: Copy + fmt::Display> {
     pub head: Mutex<u8>,
     pub tail: AtomicU8,
     pub len: AtomicUsize,
     pub pub_len: usize,
-    pub tasks: [Option<RawTask>; 256],
+    pub data: [Option<T>; 256],
 }
 
-impl Default for Fifo {
+impl<T: Copy + fmt::Display> Default for Fifo<T> {
     fn default() -> Self {
         Fifo {
             head: Mutex::new(0),
             tail: AtomicU8::new(0),
             len: AtomicUsize::new(0),
             pub_len: 0,
-            tasks: [None; 256],
+            data: [None; 256],
         }
     }
 }
 
-impl Fifo {
-    /// Attempt to push a task to the queue. Returns `Some(task)` if the queue was full, and None
+impl<T: Copy + fmt::Display> Fifo<T> {
+    /// Attempt to push data to the queue. Returns `Some(T)` if the queue was full, and None
     /// if it was pushed
     ///
     /// It is expected that the scheduler will try to wake any sleeping consumer after this call
-    pub fn push(&mut self, task: RawTask) -> Option<RawTask> {
+    pub fn push(&mut self, data: T) -> Option<T> {
         #[cfg(feature = "trace")]
-        trace!("Pushing task {}", task);
+        trace!("Pushing data {}", data);
 
         if self.is_full() {
             #[cfg(feature = "trace")]
-            trace!("Fifo is full, returning task {}", task);
-            return Some(task);
+            trace!("Fifo is full, returning data {}", data);
+            return Some(data);
         }
 
         let mut pub_len = self.len.fetch_add(1, Ordering::AcqRel);
@@ -55,7 +54,7 @@ impl Fifo {
         self.pub_len = pub_len;
 
         let tail = self.tail.fetch_add(1, Ordering::AcqRel);
-        self.tasks[tail as usize].replace(task);
+        self.data[tail as usize].replace(data);
 
         None
     }
@@ -65,16 +64,16 @@ impl Fifo {
         self.tail.load(Ordering::AcqRel)
     }
 
-    pub fn pop(&mut self) -> Option<RawTask> {
+    pub fn pop(&mut self) -> Option<T> {
         if self.is_empty() {
             #[cfg(feature = "trace")]
-            trace!("Task pop attempt with empty set");
+            trace!("Data pop attempt with empty set");
 
             return None;
         }
 
         #[cfg(feature = "trace")]
-        trace!("Popping task");
+        trace!("Popping data");
 
         let mut inc_head = 0;
         while self
@@ -83,7 +82,7 @@ impl Fifo {
             .map(|ref mut h| {
                 let head = **h;
 
-                if self.tasks[head as usize].is_some() {
+                if self.data[head as usize].is_some() {
                     **h = head.wrapping_add(1);
                 }
 
@@ -102,7 +101,7 @@ impl Fifo {
         }
 
         self.pub_len = pub_len;
-        self.tasks[inc_head as usize].take()
+        self.data[inc_head as usize].take()
     }
 
     pub fn is_full(&self) -> bool {
@@ -130,7 +129,7 @@ impl Fifo {
         }
     }
 
-    pub fn get_mut_unchecked(arc: &mut Arc<Fifo>) -> &mut Self {
+    pub fn get_mut_unchecked(arc: &mut Arc<Fifo<T>>) -> &mut Self {
         unsafe { Arc::get_mut_unchecked(arc) }
     }
 }
@@ -140,12 +139,12 @@ mod tests {
     use loom::thread;
     use std::sync::Arc;
 
-    use crate::Fifo;
+    use crate::{Fifo, RawTask};
 
     #[test]
     fn head_and_tail() {
         loom::model(|| {
-            let mut fifo = Fifo::default();
+            let mut fifo: Fifo<RawTask> = Fifo::default();
 
             assert!(fifo.pop().is_none());
 
@@ -153,15 +152,15 @@ mod tests {
             assert_eq!(0, head);
             assert_eq!(0, fifo.tail());
 
-            (0..fifo.tasks.len() - 1).for_each(|_| {
-                fifo.push(b"Some task".to_vec().into());
+            (0..fifo.data.len() - 1).for_each(|_| {
+                fifo.push(b"Some data".to_vec().into());
             });
 
             let head = fifo.head.lock().map(|ref h| **h).unwrap();
             assert_eq!(0, head);
-            assert_eq!(fifo.tasks.len() - 1, fifo.tail() as usize);
+            assert_eq!(fifo.data.len() - 1, fifo.tail() as usize);
 
-            fifo.push(b"Some task".to_vec().into());
+            fifo.push(b"Some data".to_vec().into());
             let head = fifo.head.lock().map(|ref h| **h).unwrap();
             assert_eq!(0, head);
             assert_eq!(0, fifo.tail());
@@ -174,7 +173,7 @@ mod tests {
             assert_eq!(0, fifo.tail());
 
             (0..5).for_each(|_| {
-                fifo.push(b"Some task".to_vec().into());
+                fifo.push(b"Some data".to_vec().into());
             });
             let head = fifo.head.lock().map(|ref h| **h).unwrap();
             assert_eq!(10, head);
@@ -185,10 +184,10 @@ mod tests {
     #[test]
     fn queue_push_pop() {
         loom::model(|| {
-            let fifo_base = Arc::new(Fifo::default());
+            let fifo_base: Arc<Fifo<RawTask>> = Arc::new(Fifo::default());
 
             let input = (0..256)
-                .map(|i| format!("RawTask {:06}", i))
+                .map(|i| format!("Data {:06}", i))
                 .collect::<Vec<String>>();
 
             let mut fifo = Arc::clone(&fifo_base);
@@ -200,7 +199,7 @@ mod tests {
                 }
 
                 assert!(fifo
-                    .push(format!("RawTask overflow").into_bytes().into())
+                    .push(format!("Data overflow").into_bytes().into())
                     .is_some());
             }
 
@@ -215,8 +214,8 @@ mod tests {
                     let fifo = Fifo::get_mut_unchecked(&mut fifo);
                     let mut completed = vec![];
 
-                    while let Some(task) = fifo.pop() {
-                        completed.push(String::from_utf8(task.into()).unwrap());
+                    while let Some(data) = fifo.pop() {
+                        completed.push(String::from_utf8(data.into()).unwrap());
                     }
 
                     completed
