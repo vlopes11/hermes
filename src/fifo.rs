@@ -1,10 +1,23 @@
 use crate::RawTask;
 
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "trace")]
+use tracing::trace;
+
+#[cfg(test)]
+use loom::sync::atomic::{AtomicU8, AtomicUsize};
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::thread;
+
+pub const FIFO_CAPACITY: usize = 256;
 
 pub struct Fifo {
     pub head: Mutex<u8>,
-    pub tail: u8,
+    pub tail: AtomicU8,
+    pub len: AtomicUsize,
+    pub pub_len: usize,
     pub tasks: [Option<RawTask>; 256],
 }
 
@@ -12,7 +25,9 @@ impl Default for Fifo {
     fn default() -> Self {
         Fifo {
             head: Mutex::new(0),
-            tail: 0,
+            tail: AtomicU8::new(0),
+            len: AtomicUsize::new(0),
+            pub_len: 0,
             tasks: [None; 256],
         }
     }
@@ -24,56 +39,95 @@ impl Fifo {
     ///
     /// It is expected that the scheduler will try to wake any sleeping consumer after this call
     pub fn push(&mut self, task: RawTask) -> Option<RawTask> {
+        #[cfg(feature = "trace")]
+        trace!("Pushing task {}", task);
+
         if self.is_full() {
+            #[cfg(feature = "trace")]
+            trace!("Fifo is full, returning task {}", task);
             return Some(task);
         }
 
-        // No need to set memory ordering, the consumer will always use `Option::take`.
-        // Worst case scenario, he goes to sleep at the same moment there is a task push.
-        // Since after any task push the scheduler will try to wake sleeping consumers, this will
-        // not degrade the overall performance
-        self.tasks[self.tail as usize].replace(task);
-        self.tail = self.tail.wrapping_add(1);
+        let mut pub_len = self.len.fetch_add(1, Ordering::AcqRel);
+        if pub_len <= FIFO_CAPACITY {
+            pub_len += 1;
+        }
+        self.pub_len = pub_len;
+
+        let tail = self.tail.fetch_add(1, Ordering::AcqRel);
+        self.tasks[tail as usize].replace(task);
 
         None
     }
 
-    pub fn pop(&mut self) -> Option<RawTask> {
-        // TODO - Change to Ordering::AcqRel - Critical section
-        let head = match self.head.try_lock().map(|ref mut h| {
-            let head = **h;
-            if self.tasks[head as usize].is_some() {
-                **h = head.wrapping_add(1);
-            }
-            head
-        }) {
-            Ok(h) => h,
-            Err(_) => return None,
-        };
+    #[cfg(test)]
+    pub fn tail(&self) -> u8 {
+        self.tail.load(Ordering::AcqRel)
+    }
 
-        self.tasks[head as usize].take()
+    pub fn pop(&mut self) -> Option<RawTask> {
+        if self.is_empty() {
+            #[cfg(feature = "trace")]
+            trace!("Task pop attempt with empty set");
+
+            return None;
+        }
+
+        #[cfg(feature = "trace")]
+        trace!("Popping task");
+
+        let mut inc_head = 0;
+        while self
+            .head
+            .try_lock()
+            .map(|ref mut h| {
+                let head = **h;
+
+                if self.tasks[head as usize].is_some() {
+                    **h = head.wrapping_add(1);
+                }
+
+                inc_head = head;
+            })
+            .is_err()
+        {
+            #[cfg(feature = "trace")]
+            trace!("Yielding head update");
+            thread::yield_now();
+        }
+
+        let mut pub_len = self.len.fetch_sub(1, Ordering::AcqRel);
+        if pub_len > 0 {
+            pub_len -= 1;
+        }
+
+        self.pub_len = pub_len;
+        self.tasks[inc_head as usize].take()
     }
 
     pub fn is_full(&self) -> bool {
-        // TODO - Maybe change to Ordering::Relaxed? False positives are not a problem because the
-        // worst case scenario is the task will be rescheduled
-        let head = match self.head.try_lock().map(|h| *h) {
-            Ok(h) => h,
-            Err(_) => return true,
-        };
-
-        self.tail == head && self.tasks[self.tail as usize].is_some()
+        self.pub_len == FIFO_CAPACITY
     }
 
     pub fn is_empty(&self) -> bool {
-        // TODO - Maybe change to Ordering::Relaxed? False positives are not a problem because the
-        // worst case scenario is the task will be rescheduled
-        let head = match self.head.try_lock().map(|h| *h) {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
+        self.pub_len == 0
+    }
 
-        self.tasks[head as usize].is_none()
+    pub fn len(&self) -> usize {
+        self.pub_len
+    }
+
+    pub fn head(&self) -> u8 {
+        loop {
+            match self.head.try_lock().map(|h| *h) {
+                Ok(h) => return h,
+                Err(_e) => {
+                    #[cfg(feature = "trace")]
+                    trace!("Yielding head fetch");
+                    thread::yield_now()
+                }
+            }
+        }
     }
 
     pub fn get_mut_unchecked(arc: &mut Arc<Fifo>) -> &mut Self {
@@ -90,45 +144,46 @@ mod tests {
 
     #[test]
     fn head_and_tail() {
-        let mut fifo = Fifo::default();
+        loom::model(|| {
+            let mut fifo = Fifo::default();
 
-        assert!(fifo.pop().is_none());
+            assert!(fifo.pop().is_none());
 
-        let head = fifo.head.lock().map(|ref h| **h).unwrap();
-        assert_eq!(0, head);
-        assert_eq!(0, fifo.tail);
+            let head = fifo.head.lock().map(|ref h| **h).unwrap();
+            assert_eq!(0, head);
+            assert_eq!(0, fifo.tail());
 
-        (0..fifo.tasks.len() - 1).for_each(|_| {
+            (0..fifo.tasks.len() - 1).for_each(|_| {
+                fifo.push(b"Some task".to_vec().into());
+            });
+
+            let head = fifo.head.lock().map(|ref h| **h).unwrap();
+            assert_eq!(0, head);
+            assert_eq!(fifo.tasks.len() - 1, fifo.tail() as usize);
+
             fifo.push(b"Some task".to_vec().into());
+            let head = fifo.head.lock().map(|ref h| **h).unwrap();
+            assert_eq!(0, head);
+            assert_eq!(0, fifo.tail());
+
+            (0..10).for_each(|_| {
+                fifo.pop();
+            });
+            let head = fifo.head.lock().map(|ref h| **h).unwrap();
+            assert_eq!(10, head);
+            assert_eq!(0, fifo.tail());
+
+            (0..5).for_each(|_| {
+                fifo.push(b"Some task".to_vec().into());
+            });
+            let head = fifo.head.lock().map(|ref h| **h).unwrap();
+            assert_eq!(10, head);
+            assert_eq!(5, fifo.tail());
         });
-
-        let head = fifo.head.lock().map(|ref h| **h).unwrap();
-        assert_eq!(0, head);
-        assert_eq!(fifo.tasks.len() - 1, fifo.tail as usize);
-
-        fifo.push(b"Some task".to_vec().into());
-        let head = fifo.head.lock().map(|ref h| **h).unwrap();
-        assert_eq!(0, head);
-        assert_eq!(0, fifo.tail);
-
-        (0..10).for_each(|_| {
-            fifo.pop();
-        });
-        let head = fifo.head.lock().map(|ref h| **h).unwrap();
-        assert_eq!(10, head);
-        assert_eq!(0, fifo.tail);
-
-        (0..5).for_each(|_| {
-            fifo.push(b"Some task".to_vec().into());
-        });
-        let head = fifo.head.lock().map(|ref h| **h).unwrap();
-        assert_eq!(10, head);
-        assert_eq!(5, fifo.tail);
     }
 
     #[test]
     fn queue_push_pop() {
-        // TODO - Loom is optimized for Atomic operations, which are not currently implemented
         loom::model(|| {
             let fifo_base = Arc::new(Fifo::default());
 
