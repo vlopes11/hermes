@@ -17,7 +17,7 @@ pub struct Fifo<T: Copy + fmt::Display> {
     pub tail: AtomicU8,
     pub len: AtomicUsize,
     pub pub_len: usize,
-    pub data: [Option<T>; 256],
+    pub data: [Option<T>; FIFO_CAPACITY],
 }
 
 impl<T: Copy + fmt::Display> Default for Fifo<T> {
@@ -27,7 +27,7 @@ impl<T: Copy + fmt::Display> Default for Fifo<T> {
             tail: AtomicU8::new(0),
             len: AtomicUsize::new(0),
             pub_len: 0,
-            data: [None; 256],
+            data: [None; FIFO_CAPACITY],
         }
     }
 }

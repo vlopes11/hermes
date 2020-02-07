@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::sync::{
-    mpsc::{self, Receiver, Sender, TryRecvError},
+    mpsc::{self, Receiver, SyncSender as Sender, TryRecvError},
     Arc, Mutex,
 };
 use std::task::Poll;
@@ -98,7 +98,7 @@ impl Scheduler {
 
     pub fn run<R: io::Read>(threads: usize, mut program: R) -> f64 {
         let fifo = Arc::new(Fifo::default());
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(2048);
 
         let mut scheduler = Arc::new(Self {
             fifo: Arc::clone(&fifo),
@@ -329,7 +329,7 @@ impl Scheduler {
 
 fn channel_blocking_send<T: Copy>(tx: &Sender<T>, data: T) {
     // TODO - Critical point, should be reworked
-    for _ in 0..10 {
+    for _ in 0..1000 {
         match tx.send(data) {
             Ok(_) => return (),
             Err(_e) => {
