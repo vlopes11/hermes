@@ -14,7 +14,29 @@ use std::thread::{self, JoinHandle};
 use tracing::{error, trace};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EvaluationResult {
+pub struct Evaluation {
+    pub variant: EvaluationVariant,
+    pub thread: usize,
+}
+
+impl Evaluation {
+    pub fn new(variant: EvaluationVariant, thread: usize) -> Self {
+        Self { variant, thread }
+    }
+}
+
+impl fmt::Display for Evaluation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Evaluation {{ variant: {}, thread: {} }}",
+            self.variant, self.thread
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EvaluationVariant {
     NewRawTask(RawTask),
     NotReady(RawTask),
     Store(u32, f64),
@@ -22,11 +44,11 @@ pub enum EvaluationResult {
     Sleep(usize),
 }
 
-impl fmt::Display for EvaluationResult {
+impl fmt::Display for EvaluationVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EvaluationResult::NewRawTask(task) => write!(f, "NewRawTask({})", task),
-            EvaluationResult::NotReady(task) => write!(f, "NotReady({})", task),
+            EvaluationVariant::NewRawTask(task) => write!(f, "NewRawTask({})", task),
+            EvaluationVariant::NotReady(task) => write!(f, "NotReady({})", task),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -34,8 +56,8 @@ impl fmt::Display for EvaluationResult {
 
 pub struct Scheduler {
     pub fifo: Arc<Fifo<RawTask>>,
-    pub children: Vec<JoinHandle<()>>,
-    pub sleeping_children: Vec<usize>,
+    pub worker: Vec<JoinHandle<()>>,
+    pub sleeping_worker: Vec<usize>,
     pub buffered_tasks: Vec<RawTask>,
     pub lanes: Mutex<HashMap<u32, Vec<f64>>>,
 }
@@ -102,48 +124,18 @@ impl Scheduler {
 
         let mut scheduler = Arc::new(Self {
             fifo: Arc::clone(&fifo),
-            children: vec![],
-            sleeping_children: vec![],
+            worker: vec![],
+            sleeping_worker: vec![],
             buffered_tasks: vec![],
             lanes: Mutex::new(Scheduler::initialize_lanes_from_reader(&mut program)),
         });
 
-        let children: Vec<JoinHandle<()>> = (0..threads)
+        let worker: Vec<JoinHandle<()>> = (0..threads)
             .map(|i| {
-                let mut parent = Arc::clone(&scheduler);
+                let parent = Arc::clone(&scheduler);
                 let tx_result = tx.clone();
 
-                thread::spawn(move || {
-                    let child_index = i;
-
-                    loop {
-                        let result = match Scheduler::get_mut_unchecked(&mut parent).pop_task() {
-                            Some(task) => {
-                                #[cfg(feature = "trace")]
-                                trace!("{:?} Task received: {}", thread::current().id(), task);
-
-                                let result = task.execute(Arc::clone(&parent));
-
-                                #[cfg(feature = "trace")]
-                                trace!("{:?} Task executed: {}", thread::current().id(), result);
-
-                                result
-                            }
-                            None => {
-                                #[cfg(feature = "trace")]
-                                trace!("Yielding thread {:?}", thread::current().id());
-
-                                EvaluationResult::Sleep(child_index)
-                            }
-                        };
-
-                        channel_blocking_send(&tx_result, result);
-
-                        if let EvaluationResult::Sleep(_) = result {
-                            thread::park();
-                        }
-                    }
-                })
+                thread::spawn(move || thread_loop(i, parent, tx_result))
             })
             .collect();
 
@@ -151,7 +143,7 @@ impl Scheduler {
             let tx_event = tx.clone();
             let result = thread::spawn(move || {
                 let mut scheduler = Arc::get_mut_unchecked(&mut scheduler);
-                scheduler.children = children;
+                scheduler.worker = worker;
                 Scheduler::event_loop(scheduler, rx, tx_event)
             });
 
@@ -165,19 +157,19 @@ impl Scheduler {
         result
     }
 
-    fn parser_loop<R: io::Read>(mut program: R, tx: Sender<EvaluationResult>) {
+    fn parser_loop<R: io::Read>(mut program: R, tx: Sender<Evaluation>) {
         while let Some(task) = RawTask::from_reader(&mut program) {
             #[cfg(feature = "trace")]
             trace!("Parsed task {}", task);
 
-            channel_blocking_send(&tx, EvaluationResult::NewRawTask(task));
+            channel_blocking_send(&tx, Evaluation::new(EvaluationVariant::NewRawTask(task), 0));
         }
     }
 
     fn event_loop(
         scheduler: &mut Scheduler,
-        rx: Receiver<EvaluationResult>,
-        tx: Sender<EvaluationResult>,
+        rx: Receiver<Evaluation>,
+        tx: Sender<Evaluation>,
     ) -> f64 {
         #[cfg(feature = "trace")]
         trace!("Initiating event loop");
@@ -189,14 +181,14 @@ impl Scheduler {
                         #[cfg(feature = "trace")]
                         trace!("Received task {}", task);
 
-                        match task {
-                            EvaluationResult::NewRawTask(task) => scheduler.push_task(task),
-                            EvaluationResult::NotReady(task) => scheduler.push_task(task),
-                            EvaluationResult::Store(idx, value) => {
-                                scheduler.push_lane(&tx, idx, value)
+                        match task.variant {
+                            EvaluationVariant::NewRawTask(task) => scheduler.push_task(task),
+                            EvaluationVariant::NotReady(task) => scheduler.push_task(task),
+                            EvaluationVariant::Store(idx, value) => {
+                                scheduler.push_lane(&tx, idx, value, task.thread)
                             }
-                            EvaluationResult::Sleep(idx) => scheduler.sleeping_children.push(idx),
-                            EvaluationResult::Return(result) => return result,
+                            EvaluationVariant::Sleep(idx) => scheduler.sleeping_worker.push(idx),
+                            EvaluationVariant::Return(result) => return result,
                         }
 
                         #[cfg(feature = "trace")]
@@ -220,17 +212,17 @@ impl Scheduler {
 
             // Max attempts
             for _ in 0..5 {
-                if scheduler.sleeping_children.is_empty() || scheduler.fifo.is_empty() {
+                if scheduler.sleeping_worker.is_empty() || scheduler.fifo.is_empty() {
                     break;
                 }
 
-                if let Some(child) = scheduler.sleeping_children.pop() {
+                if let Some(worker) = scheduler.sleeping_worker.pop() {
                     #[cfg(feature = "trace")]
                     trace!(
-                        "Awaking child {:?}",
-                        scheduler.children[child].thread().id()
+                        "Awaking worker {:?}",
+                        scheduler.worker[worker].thread().id()
                     );
-                    scheduler.children[child].thread().unpark();
+                    scheduler.worker[worker].thread().unpark();
                 }
             }
         }
@@ -260,7 +252,7 @@ impl Scheduler {
         unsafe { Arc::get_mut_unchecked(arc) }
     }
 
-    fn push_lane(&self, tx: &Sender<EvaluationResult>, idx: u32, value: f64) {
+    fn push_lane(&self, tx: &Sender<Evaluation>, idx: u32, value: f64, thread: usize) {
         #[cfg(feature = "trace")]
         trace!("Attempting to push {} to lane {}", value, idx);
 
@@ -278,7 +270,10 @@ impl Scheduler {
 
             // Resource not available, reschedule evaluation
             Err(_) => {
-                channel_blocking_send(&tx, EvaluationResult::Store(idx, value));
+                channel_blocking_send(
+                    &tx,
+                    Evaluation::new(EvaluationVariant::Store(idx, value), thread),
+                );
             }
         }
     }
@@ -323,6 +318,36 @@ impl Scheduler {
                 thread::yield_now();
                 Poll::Pending
             }
+        }
+    }
+}
+
+fn thread_loop(worker_index: usize, mut parent: Arc<Scheduler>, tx: Sender<Evaluation>) {
+    loop {
+        let result = match Scheduler::get_mut_unchecked(&mut parent).pop_task() {
+            Some(task) => {
+                #[cfg(feature = "trace")]
+                trace!("{:?} Task received: {}", thread::current().id(), task);
+
+                let result = task.execute(Arc::clone(&parent), worker_index);
+
+                #[cfg(feature = "trace")]
+                trace!("{:?} Task executed: {}", thread::current().id(), result);
+
+                result
+            }
+            None => {
+                #[cfg(feature = "trace")]
+                trace!("Yielding thread {:?}", thread::current().id());
+
+                Evaluation::new(EvaluationVariant::Sleep(worker_index), worker_index)
+            }
+        };
+
+        channel_blocking_send(&tx, result);
+
+        if let EvaluationVariant::Sleep(_) = result.variant {
+            thread::park();
         }
     }
 }

@@ -3,7 +3,7 @@
 
 pub use crate::fifo::{Fifo, FIFO_CAPACITY};
 pub use crate::operation::{Operation, OperationIterator};
-pub use crate::scheduler::{EvaluationResult, Scheduler};
+pub use crate::scheduler::{Evaluation, EvaluationVariant, Scheduler};
 pub use crate::task::{RawTask, Task};
 
 pub mod fifo;

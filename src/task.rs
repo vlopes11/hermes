@@ -1,4 +1,4 @@
-use crate::{EvaluationResult, Operation, OperationIterator, Scheduler};
+use crate::{Evaluation, EvaluationVariant, Operation, OperationIterator, Scheduler};
 
 use std::fmt;
 use std::io;
@@ -39,12 +39,14 @@ impl Task {
     /// Panics if the first operation is not multiple arguments.
     ///
     /// Panics is the last operation is not store or return
-    fn execute(self, scheduler: Arc<Scheduler>) -> EvaluationResult {
+    fn execute(self, scheduler: Arc<Scheduler>, thread_id: usize) -> Evaluation {
         #[cfg(feature = "trace")]
         trace!("Executing task {:?}", self);
 
         match self.ops[0] {
-            Operation::Return => return EvaluationResult::Return(0.00f64),
+            Operation::Return => {
+                return Evaluation::new(EvaluationVariant::Return(0.00f64), thread_id)
+            }
             Operation::Undefined => panic!("Undefined operation!"),
             _ => (),
         }
@@ -57,7 +59,7 @@ impl Task {
         let mut result = match scheduler.fetch_from_lane(lane, size as usize) {
             Poll::Ready(data) => self.ops[0].execute_multiple(data.as_slice()),
             Poll::Pending => {
-                return EvaluationResult::NotReady(self.into());
+                return Evaluation::new(EvaluationVariant::NotReady(self.into()), thread_id);
             }
         };
 
@@ -70,15 +72,20 @@ impl Task {
                 match scheduler.fetch_from_lane(lane, size as usize) {
                     Poll::Ready(data) => self.ops[i].execute_multiple(data.as_slice()),
                     Poll::Pending => {
-                        return EvaluationResult::NotReady(self.into());
+                        return Evaluation::new(
+                            EvaluationVariant::NotReady(self.into()),
+                            thread_id,
+                        );
                     }
                 }
             };
         }
 
         match self.ops[self.ops.len() - 1] {
-            Operation::Return => EvaluationResult::Return(result),
-            Operation::Store(lane) => EvaluationResult::Store(lane, result),
+            Operation::Return => Evaluation::new(EvaluationVariant::Return(result), thread_id),
+            Operation::Store(lane) => {
+                Evaluation::new(EvaluationVariant::Store(lane, result), thread_id)
+            }
             _ => panic!("The last operation of the task must be either return or store!"),
         }
     }
@@ -150,8 +157,8 @@ impl Into<Vec<u8>> for RawTask {
 
 impl RawTask {
     // Equivalent to Future::poll
-    pub fn execute(self, scheduler: Arc<Scheduler>) -> EvaluationResult {
-        Task::from(self).execute(scheduler)
+    pub fn execute(self, scheduler: Arc<Scheduler>, thread_id: usize) -> Evaluation {
+        Task::from(self).execute(scheduler, thread_id)
     }
 }
 
