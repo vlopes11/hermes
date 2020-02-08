@@ -11,6 +11,7 @@ trace = ["tracing", "tracing-subscriber"]
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.1", optional = true }
 rand = "0.7"
+clap = "2.33"
 
 [dev-dependencies]
 loom = "^0.2"
