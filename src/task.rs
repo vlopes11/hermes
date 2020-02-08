@@ -158,7 +158,10 @@ impl Into<Vec<u8>> for RawTask {
 impl RawTask {
     // Equivalent to Future::poll
     pub fn execute(self, scheduler: Arc<Scheduler>, thread_id: usize) -> Evaluation {
-        Task::from(self).execute(scheduler, thread_id)
+        let task: Task = self.clone().into();
+        Task::from(self)
+            .execute(scheduler, thread_id)
+            .finish(task.into())
     }
 }
 

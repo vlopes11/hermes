@@ -1,4 +1,4 @@
-use crate::{Fifo, RawTask};
+use crate::{Fifo, RawTask, Task};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::task::Poll;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 #[cfg(feature = "trace")]
 use tracing::{error, trace};
@@ -17,11 +18,52 @@ use tracing::{error, trace};
 pub struct Evaluation {
     pub variant: EvaluationVariant,
     pub thread: usize,
+    pub start: Instant,
+    pub end: Instant,
+    pub task: Option<RawTask>,
 }
 
 impl Evaluation {
     pub fn new(variant: EvaluationVariant, thread: usize) -> Self {
-        Self { variant, thread }
+        Self {
+            variant,
+            thread,
+            start: Instant::now(),
+            end: Instant::now(),
+            task: None,
+        }
+    }
+
+    pub fn finish(mut self, task: RawTask) -> Self {
+        self.end = Instant::now();
+        self.task.replace(task);
+        self
+    }
+
+    pub fn dispatch(self, scheduler: &mut Scheduler, tx: &Sender<Evaluation>) -> Option<f64> {
+        #[cfg(feature = "trace")]
+        trace!("Received task {}", self);
+
+        match self.variant {
+            EvaluationVariant::NewRawTask(task) => scheduler.push_task(task),
+            EvaluationVariant::NotReady(task) => scheduler.push_task(task),
+            EvaluationVariant::Store(idx, value) => {
+                scheduler.blocking_push_step(
+                    idx,
+                    self.task.map(|t| t.into()).unwrap_or_default(),
+                    self.start,
+                    self.end,
+                );
+                scheduler.push_lane(tx, idx, value, self)
+            }
+            EvaluationVariant::Sleep(idx) => scheduler.sleeping_worker.push(idx),
+            EvaluationVariant::Return(result) => return Some(result),
+        }
+
+        #[cfg(feature = "trace")]
+        trace!("Task submitted");
+
+        None
     }
 }
 
@@ -60,6 +102,7 @@ pub struct Scheduler {
     pub sleeping_worker: Vec<usize>,
     pub buffered_tasks: Vec<RawTask>,
     pub lanes: Mutex<HashMap<u32, Vec<f64>>>,
+    pub history: Mutex<HashMap<u32, (Task, Instant, Instant)>>,
 }
 
 impl Scheduler {
@@ -128,6 +171,7 @@ impl Scheduler {
             sleeping_worker: vec![],
             buffered_tasks: vec![],
             lanes: Mutex::new(Scheduler::initialize_lanes_from_reader(&mut program)),
+            history: Mutex::new(HashMap::new()),
         });
 
         let worker: Vec<JoinHandle<()>> = (0..threads)
@@ -177,22 +221,10 @@ impl Scheduler {
         loop {
             loop {
                 match rx.try_recv() {
-                    Ok(task) => {
-                        #[cfg(feature = "trace")]
-                        trace!("Received task {}", task);
-
-                        match task.variant {
-                            EvaluationVariant::NewRawTask(task) => scheduler.push_task(task),
-                            EvaluationVariant::NotReady(task) => scheduler.push_task(task),
-                            EvaluationVariant::Store(idx, value) => {
-                                scheduler.push_lane(&tx, idx, value, task.thread)
-                            }
-                            EvaluationVariant::Sleep(idx) => scheduler.sleeping_worker.push(idx),
-                            EvaluationVariant::Return(result) => return result,
+                    Ok(evaluation) => {
+                        if let Some(result) = evaluation.dispatch(scheduler, &tx) {
+                            return result;
                         }
-
-                        #[cfg(feature = "trace")]
-                        trace!("Task submitted");
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => panic!("Channel is disconnected"),
@@ -252,7 +284,7 @@ impl Scheduler {
         unsafe { Arc::get_mut_unchecked(arc) }
     }
 
-    fn push_lane(&self, tx: &Sender<Evaluation>, idx: u32, value: f64, thread: usize) {
+    fn push_lane(&self, tx: &Sender<Evaluation>, idx: u32, value: f64, task: Evaluation) {
         #[cfg(feature = "trace")]
         trace!("Attempting to push {} to lane {}", value, idx);
 
@@ -270,12 +302,38 @@ impl Scheduler {
 
             // Resource not available, reschedule evaluation
             Err(_) => {
-                channel_blocking_send(
-                    &tx,
-                    Evaluation::new(EvaluationVariant::Store(idx, value), thread),
-                );
+                channel_blocking_send(&tx, task.clone());
             }
         }
+    }
+
+    fn blocking_push_step(&self, lane: u32, task: Task, start: Instant, end: Instant) {
+        // TODO - Critical point, should be reworked
+        for _ in 0..1000 {
+            #[cfg(feature = "trace")]
+            trace!("Attempting to push to tasks history");
+
+            match self.history.try_lock() {
+                Ok(mut history) => {
+                    history.insert(lane, (task.clone(), start, end));
+
+                    #[cfg(feature = "trace")]
+                    trace!("Task history inserted");
+
+                    return ();
+                }
+
+                // Resource not available, reschedule evaluation
+                Err(_e) => {
+                    #[cfg(feature = "trace")]
+                    error!("Task history push failed: {}", _e);
+                    thread::yield_now();
+                }
+            }
+        }
+
+        eprintln!("Channel send failed with max attempts");
+        std::process::exit(1);
     }
 
     pub fn fetch_from_lane(&self, idx: u32, items: usize) -> Poll<Vec<f64>> {
