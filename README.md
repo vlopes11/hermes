@@ -51,7 +51,7 @@ After the task is parsed, it is sent to the Scheduler via a `mpsc::channel`
 
 # Usage
 
-![hermes](https://user-images.githubusercontent.com/8730839/74088499-7748d380-4a97-11ea-85dc-ebc673b112d9.gif)
+![hermes](https://user-images.githubusercontent.com/8730839/74088821-c04e5700-4a9a-11ea-98d2-1b51997b2fab.gif)
 
 ## Requirements
 
