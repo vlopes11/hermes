@@ -1,6 +1,7 @@
 use std::io;
 use std::ops::{Neg, Rem};
 
+use rand::Rng;
 #[cfg(feature = "trace")]
 use tracing::trace;
 
@@ -60,6 +61,60 @@ pub enum Operation {
 impl Operation {
     pub fn to_vec(self) -> Vec<u8> {
         self.into()
+    }
+
+    pub fn random_serial() -> Self {
+        match rand::thread_rng().gen_range(0, 33) {
+            00 => Operation::Abs,
+            01 => Operation::Acos,
+            02 => Operation::Acosh,
+            03 => Operation::Asin,
+            04 => Operation::Asinh,
+            05 => Operation::Atan,
+            06 => Operation::Atanh,
+            07 => Operation::Cbrt,
+            08 => Operation::Ceil,
+            09 => Operation::Cos,
+            10 => Operation::Cosh,
+            11 => Operation::Exp,
+            12 => Operation::Exp2,
+            13 => Operation::ExpM1,
+            14 => Operation::Floor,
+            15 => Operation::Fract,
+            16 => Operation::Ln,
+            17 => Operation::Ln1p,
+            18 => Operation::Log((10.0f64 * rand::thread_rng().gen::<f64>()).trunc()),
+            19 => Operation::Log10,
+            20 => Operation::Log2,
+            21 => Operation::Neg,
+            22 => Operation::Pow((5.0f64 * rand::thread_rng().gen::<f64>()).trunc()),
+            23 => Operation::Recip,
+            24 => Operation::Round,
+            25 => Operation::Signum,
+            26 => Operation::Sin,
+            27 => Operation::Sinh,
+            28 => Operation::Sqrt,
+            29 => Operation::Tan,
+            30 => Operation::Tanh,
+            31 => Operation::ToRadians,
+            _ => Operation::Trunc,
+        }
+    }
+
+    pub fn random_parallel(lane: u32, size: u32) -> Self {
+        match rand::thread_rng().gen_range(0, 11) {
+            0 => Operation::Add(lane, size),
+            1 => Operation::Atan2(lane, size),
+            2 => Operation::Div(lane, size),
+            3 => Operation::DivEuclid(lane, size),
+            4 => Operation::Hypot(lane, size),
+            5 => Operation::Max(lane, size),
+            6 => Operation::Min(lane, size),
+            7 => Operation::Mul(lane, size),
+            8 => Operation::Rem(lane, size),
+            9 => Operation::RemEuclid(lane, size),
+            _ => Operation::Sub(lane, size),
+        }
     }
 
     pub fn execute(self, x: f64) -> f64 {

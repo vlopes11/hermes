@@ -177,14 +177,29 @@ impl Scheduler {
         let fifo = Arc::new(Fifo::default());
         let (tx, rx) = mpsc::sync_channel(2048);
 
+        let start = Instant::now();
+        let lanes = Scheduler::initialize_lanes_from_reader(&mut program);
+        let solution = lanes
+            .iter()
+            .map(|(lane, values)| {
+                format!(
+                    "{:09} {:09} Init({}) {:?}\n",
+                    start.elapsed().as_nanos(),
+                    start.elapsed().as_nanos(),
+                    lane,
+                    values,
+                )
+            })
+            .collect();
+
         let mut scheduler = Arc::new(Self {
             fifo: Arc::clone(&fifo),
             worker: vec![],
             sleeping_worker: vec![],
             buffered_tasks: vec![],
-            lanes: Mutex::new(Scheduler::initialize_lanes_from_reader(&mut program)),
-            start: Instant::now(),
-            solution: vec![],
+            lanes: Mutex::new(lanes),
+            start,
+            solution,
         });
 
         let worker: Vec<JoinHandle<()>> = (0..threads)
@@ -332,9 +347,9 @@ impl Scheduler {
 
     fn print_history(&mut self, task: Task, start: Duration, end: Duration, lb: bool) {
         self.solution.push(format!(
-            "{:>15} {:>15} {:?}{}",
-            format!("{:?}", start),
-            format!("{:?}", end),
+            "{:09} {:09} {:?}{}",
+            start.as_nanos(),
+            end.as_nanos(),
             task.ops,
             if lb { "\n" } else { "" }
         ));

@@ -7,6 +7,7 @@ pub use crate::scheduler::{Evaluation, EvaluationVariant, Scheduler};
 pub use crate::task::{RawTask, Task};
 
 pub mod fifo;
+pub mod generator;
 pub mod operation;
 pub mod scheduler;
 pub mod task;

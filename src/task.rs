@@ -111,6 +111,12 @@ impl From<Task> for RawTask {
     }
 }
 
+impl From<Vec<Operation>> for Task {
+    fn from(ops: Vec<Operation>) -> Self {
+        Self { ops }
+    }
+}
+
 #[derive(Debug, Copy, PartialEq)]
 pub struct RawTask {
     ptr: *mut u8,
