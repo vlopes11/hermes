@@ -10,7 +10,7 @@ use tracing::trace;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Task {
-    ops: Vec<Operation>,
+    pub ops: Vec<Operation>,
 }
 
 impl Task {
@@ -159,9 +159,11 @@ impl RawTask {
     // Equivalent to Future::poll
     pub fn execute(self, scheduler: Arc<Scheduler>, thread_id: usize) -> Evaluation {
         let task: Task = self.clone().into();
+        let start = scheduler.start.elapsed();
+        let scheduler_start = scheduler.start;
         Task::from(self)
             .execute(scheduler, thread_id)
-            .finish(task.into())
+            .finish(start, scheduler_start, task.into())
     }
 }
 

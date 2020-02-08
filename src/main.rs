@@ -4,7 +4,7 @@ fn main() {
     #[cfg(feature = "trace")]
     {
         let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
+            .with_max_level(tracing::Level::DEBUG)
             .finish();
         tracing::subscriber::set_global_default(subscriber).unwrap();
     }
@@ -27,6 +27,7 @@ fn main() {
     bytes.extend_from_slice(&Operation::Mul(5, 3).to_vec());
     bytes.extend_from_slice(&Operation::Return.to_vec());
 
-    let result = Scheduler::run(3, bytes.as_slice());
-    println!("{}", result);
+    Scheduler::run(3, bytes.as_slice())
+        .iter()
+        .for_each(|s| print!("{}", s));
 }
